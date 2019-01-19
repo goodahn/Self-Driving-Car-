@@ -4,6 +4,7 @@ from tensorflow.core.protobuf import saver_pb2
 import driving_data
 import model
 import time
+import numpy as np
 
 def read_and_decode(proto):
   
@@ -81,25 +82,27 @@ def average_gradients(tower_grads):
 
 
 epochs = 30
-batch_size = 200
 FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_integer('num_gpus', 1,
               """How many GPUs to use.""")
+tf.app.flags.DEFINE_integer('batch_size', 200,
+              """How much batch size to use.""")
 
 start = time.time()
 LOGDIR = './save'
+batch_size = int(FLAGS.batch_size/FLAGS.num_gpus)
 
 sess = tf.InteractiveSession(config=tf.ConfigProto(allow_soft_placement=True))
 #sess.run(tf.initialize_all_variables())
 
 L2NormConst = 0.001
 
-opt = tf.train.AdamOptimizer(1e-4)
+opt = tf.train.AdamOptimizer(1e-4*FLAGS.num_gpus)
 
 filename_queue =   ["driving_dataset_tf/train_data.tfrecords"]
-rawdataset = tf.data.TFRecordDataset(filename_queue)
-dataset = rawdataset.map(read_and_decode)
+dataset = tf.data.TFRecordDataset(filename_queue)
+#dataset = rawdataset.map(read_and_decode)
 #Xs, Ys = read_and_decode(filename_queue)
 #sess.run(tf.global_variables_initializer())
 #ys = sess.run(Ys)
@@ -119,9 +122,10 @@ for i in range(FLAGS.num_gpus):
   print("{:d}th device".format(i))
   with tf.variable_scope("cnn"):
     with tf.name_scope("train_{:d}".format(i)) as scope:
-      with tf.device("/gpu:{:d}".format(i)):
+      with tf.device("/device:GPU:{:d}".format(i)):
         shared_dataset = dataset.shard(FLAGS.num_gpus, i)
-        shared_dataset_batch = shared_dataset.shuffle(100000000).repeat(epochs*3).batch(batch_size)
+        shared_dataset = shared_dataset.map(read_and_decode, num_parallel_calls=16)
+        shared_dataset_batch = shared_dataset.repeat(epochs*20).batch(batch_size)
         iterator = shared_dataset_batch.make_initializable_iterator()
         sess.run(iterator.initializer)
         x_batch, y_batch = iterator.get_next()
@@ -135,11 +139,12 @@ for i in range(FLAGS.num_gpus):
           print( "Shape: ", v.shape)
           print(v)
         '''
-        loss = tf.reduce_mean(tf.square(tf.subtract(y_batch, model.get_model(x_batch)))) \
-            + tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()]) * L2NormConst
-        tf.get_variable_scope().reuse_variables()
+        loss = tf.reduce_mean(tf.square(tf.subtract(y_batch, model.get_model(x_batch, i>0))), name='loss')
+        loss_b =  tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()], name='loss_b') * L2NormConst
+        loss = loss + loss_b
+        #tf.get_variable_scope().reuse_variables()
         summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
-        grads = opt.compute_gradients(loss)
+        grads = opt.compute_gradients(loss, colocate_gradients_with_ops=True)
         tower_grads.append(grads)
 
 grads = average_gradients(tower_grads)
@@ -148,7 +153,7 @@ apply_gradient_op = opt.apply_gradients(grads)
 variable_averages = tf.train.ExponentialMovingAverage(0.9999)
 variables_averages_op = variable_averages.apply(tf.trainable_variables())
 
-train_op = tf.group(apply_gradient_op, variables_averages_op)
+train_op = tf.group(apply_gradient_op)#, variables_averages_op)
 
 for grad, var in grads:
   if grad is not None:
@@ -175,15 +180,15 @@ summary_writer = tf.summary.FileWriter(logs_path, graph=tf.get_default_graph())
 
 # train over the dataset about 30 times
 for epoch in range(epochs):
-  for i in range(int(37100/batch_size)):
+  for i in range(int(37100/(batch_size*FLAGS.num_gpus))):
   #xs, ys = driving_data.LoadTrainBatch(batch_size)
   #train_step.run(feed_dict={model.x: xs, model.y_: ys, model.keep_prob: 0.8})
-    _, loss_value = sess.run([train_op, loss])
+    _, loss_value, loss_b_value = sess.run([train_op, loss, loss_b])
 
     if i % 10 == 0:
       # xs, ys = driving_data.LoadValBatch(batch_size)
       # loss_value = loss.eval(feed_dict={model.x:xs, model.y_: ys, model.keep_prob: 1.0})
-      print("Epoch: %d, Step: %d, Loss: %g" % (epoch, epoch * batch_size + i, loss_value))
+      print("Epoch: %d, Step: %d, Loss: %g, Loss bias : %g" % (epoch, epoch * batch_size*FLAGS.num_gpus + i, loss_value, loss_b_value))
  
     # write logs at every iteration
     #summary = merged_summary_op.eval(feed_dict={model.x:xs, model.y_: ys, model.keep_prob: 1.0})
@@ -192,7 +197,7 @@ for epoch in range(epochs):
     if i % batch_size == 0:
       if not os.path.exists(LOGDIR):
         os.makedirs(LOGDIR)
-      checkpoint_path = os.path.join(LOGDIR, "model2.ckpt")
+      checkpoint_path = os.path.join(LOGDIR, "model{:d}.ckpt".format(FLAGS.num_gpus))
       filename = saver.save(sess, checkpoint_path)
       print("Model saved in file: %s" % filename)
 
